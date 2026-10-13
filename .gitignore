@@ -1,0 +1,23 @@
+# Configuration et données personnelles ; seuls les modèles peuvent être commités.
+config.env
+.env
+.env.*
+!.env.example
+.local/
+
+# Sessions WhatsApp / profils et clés : ne jamais publier.
+.wwebjs_auth/
+.wwebjs_cache/
+session/
+*.tar.gz
+*.tgz
+*.pem
+*.key
+service-account*.json
+*credentials*.json
+
+# Logs et fichiers générés par le guide.
+*.log
+calendrier.csv
+node_modules/
+.DS_Store
