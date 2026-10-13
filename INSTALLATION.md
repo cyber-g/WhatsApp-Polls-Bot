@@ -112,7 +112,7 @@ docker run --rm --entrypoint node \
   "$IMAGE" --test /app/bot.test.cjs
 ```
 
-Attendu : `Image OK`, puis `20 tests réussis`. Aucun package à installer ici :
+Attendu : `Image OK`, puis tous les tests réussis. Aucun package à installer ici :
 ils ont été installés pendant la construction dans le dépôt Docker séparé.
 
 Conseillé : conserver la référence exacte de cette image testée.
@@ -257,6 +257,29 @@ Copier l'identifiant du groupe de test dans `GROUP_ID` et son nom exact dans
 Attendre `session_saved` et le retour normal de la commande. Ne pas interrompre
 juste après le scan : il faut fermer Chrome proprement et sauvegarder le profil.
 `--user` permet d'écrire l'archive avec ton UID local, même si ce n'est pas 1000.
+
+La liste lit seulement les noms et identifiants des groupes chargés, sans
+sérialiser leurs messages et métadonnées via `getChats()`. Cela contourne
+l'erreur `r: r` observée avec `whatsapp-web.js` 1.34.7. Cette lecture dépend
+d'une interface interne de WhatsApp Web ; un format incompatible provoque une
+erreur explicite, pas une liste partielle supposée fiable.
+
+Les groupes dont le nom est vide sont affichés comme `(nom indisponible)`, avec
+un avertissement `groups_without_name`. Ils n'empêchent pas de sélectionner les
+autres groupes ; le groupe configuré doit toutefois avoir son nom exact et non
+vide pour autoriser une publication.
+
+Si la lecture des groupes échoue après connexion, la session est tout de même
+sauvegardée après fermeture de Chrome, mais la commande termine en erreur.
+`session_saved` seul ne suffit donc pas : ne pas continuer le déploiement sans
+la liste des groupes et une fin normale. Une archive déjà présente peut provenir
+d'une ancienne tentative ; sa seule présence ne prouve pas un nouvel appairage.
+Voir [le dépannage](EXPLOITATION.md#depannage).
+
+Pour relire les groupes depuis une archive sauvegardée lors de cette tentative,
+sans nouveau QR, remplacer `pair` par `groups` dans la commande Docker ci-dessus.
+Cette commande restaure puis sauvegarde la même session ; elle n'envoie aucun
+sondage et refuse une session expirée au lieu d'afficher un QR.
 
 ```bash
 ls -lh .local/session.tar.gz
