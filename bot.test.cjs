@@ -7,8 +7,12 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
+const vm = require('node:vm');
 const exec = require('node:util').promisify(require('node:child_process').execFile);
-const { dateAfter, selectEvent, publishOnce, sendConfirmed, storage, packSession, run, main } = require('./bot.cjs');
+const {
+  dateAfter, selectEvent, publishOnce, sendConfirmed, storage, packSession,
+  getGroups, checkGroup, pairSession, run, main,
+} = require('./bot.cjs');
 const HEADER = ['Date', 'Actif', 'Titre'];
 const ENV = {
   SPREADSHEET_ID: 'sheet', SHEETS_READER: 'reader', STATE_BUCKET: 'bucket',
@@ -192,6 +196,140 @@ test('mauvaise configuration refusée avant tout réseau', async t => {
   await assert.rejects(run({}), /Configuration manquante/);
   await assert.rejects(run({ ...ENV, GROUP_ID: '123@c.us' }), /groupe/);
   await assert.rejects(run({ ...ENV, LEAD_DAYS: 'abc' }), /LEAD_DAYS/);
+});
+
+test('lecture légère : groupes seulement, sans sérialiser les discussions ou messages', async () => {
+  const group = {
+    groupMetadata: {}, id: { toString: () => '123-456@g.us' }, formattedTitle: 'TEST bot sondages',
+    serialize: () => assert.fail('ne pas sérialiser le groupe'),
+    get lastReceivedKey() { assert.fail('ne pas lire les messages'); },
+  };
+  const client = {
+    getChats: () => assert.fail('ne pas appeler getChats'),
+    getChatById: () => assert.fail('ne pas appeler getChatById'),
+    pupPage: {
+      async evaluate(reader) {
+        const result = vm.runInNewContext(`(${reader.toString()})()`, {
+          window: {
+            require(name) {
+              assert.equal(name, 'WAWebCollections');
+              return { Chat: { getModelsArray: () => [
+                { groupMetadata: null, get id() { assert.fail('ignorer les discussions privées'); } },
+                group,
+              ] } };
+            },
+          },
+        });
+        return structuredClone(result);
+      },
+    },
+  };
+  assert.deepEqual(await getGroups(client), [{ id: '123-456@g.us', name: 'TEST bot sondages' }]);
+});
+
+test('lecture légère : données incompatibles refusées, liste vide distincte d’une erreur', async () => {
+  for (const groups of [null, {}, [null], [{ id: '123@c.us', name: 'privé' }],
+    [{ id: '123@g.us', name: null }], [{ id: '123@g.us' }]]) {
+    await assert.rejects(getGroups({ pupPage: { evaluate: async () => groups } }), /incompatible/);
+  }
+  assert.deepEqual(await getGroups({ pupPage: { evaluate: async () => [] } }), []);
+  const original = new Error('r');
+  await assert.rejects(getGroups({ pupPage: { evaluate: async () => { throw original; } } }), error => {
+    assert.match(error.message, /Lecture des groupes impossible : r/);
+    assert.equal(error.cause, original);
+    return true;
+  });
+  await assert.rejects(getGroups({ pupPage: { evaluate: async () =>
+    Array.from({ length: 100 }, () => ({ id: '123@g.us' })) } }), error => {
+    assert.match(error.message, /index=0, idValide=true, typeNom=undefined/);
+    assert.match(error.message, /index=2/);
+    assert.doesNotMatch(error.message, /index=3|123@g\.us/);
+    return true;
+  });
+});
+
+test('groupes sans nom : avertissement explicite, seul le groupe exact et nommé autorise l’envoi', async t => {
+  const logs = t.mock.method(console, 'log', () => {});
+  const groups = [
+    { id: '111@g.us', name: '' }, { id: '222@g.us', name: '   ' },
+    { id: '333@g.us', name: 'TEST bot sondages' },
+  ];
+  const client = { pupPage: { evaluate: async () => groups } };
+  assert.deepEqual(await getGroups(client), groups);
+  const warning = JSON.parse(logs.mock.calls[0].arguments[0]);
+  assert.equal(warning.event, 'groups_without_name');
+  assert.equal(warning.severity, 'WARNING');
+  assert.equal(warning.count, 2);
+  await checkGroup(client, '333@g.us', 'TEST bot sondages');
+  await assert.rejects(checkGroup(client, '333@g.us', 'test bot sondages'), /Groupe incorrect/);
+  await assert.rejects(checkGroup(client, '444@g.us', 'TEST bot sondages'), /Groupe incorrect/);
+  await assert.rejects(checkGroup(client, '111@g.us', ''), /Groupe incorrect/);
+  await assert.rejects(checkGroup(client, '222@g.us', '   '), /Groupe incorrect/);
+});
+
+test('appairage : fermeture puis archive privée, même si la lecture des groupes échoue', async t => {
+  t.mock.method(console, 'log', () => {});
+  const tables = t.mock.method(console, 'table', () => {});
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wa-test-'));
+  try {
+    for (const fails of [false, true]) {
+      const profile = path.join(tmp, fails ? 'failed-profile' : 'profile');
+      const archive = path.join(tmp, fails ? 'failed-session.tar.gz' : 'session.tar.gz');
+      await fs.mkdir(profile);
+      const client = new EventEmitter();
+      client.pupBrowser = {};
+      client.initialize = async () => client.emit('ready');
+      client.pupPage = { evaluate: async () => {
+        if (fails) throw new Error('r');
+        return [{ id: '123@g.us', name: 'test' }, { id: '456@g.us', name: '' }];
+      } };
+      client.destroy = async () => {
+        await fs.writeFile(path.join(profile, 'session-closed'), 'session-factice');
+        client.pupBrowser = null;
+      };
+      if (fails) await assert.rejects(pairSession(client, profile, archive), /Lecture des groupes impossible : r/);
+      else await pairSession(client, profile, archive);
+      assert.equal(client.pupBrowser, null);
+      assert.equal((await fs.stat(archive)).mode & 0o777, 0o600);
+      const { stdout } = await exec('tar', ['-xOzf', archive, './session-closed']);
+      assert.equal(stdout, 'session-factice');
+      await assert.rejects(fs.stat(profile), { code: 'ENOENT' });
+    }
+    assert.equal(tables.mock.callCount(), 1);
+    assert.deepEqual(tables.mock.calls[0].arguments[0], [
+      { nom: 'test', GROUP_ID: '123@g.us' },
+      { nom: '(nom indisponible)', GROUP_ID: '456@g.us' },
+    ]);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('appairage refusé ou archive expirée : navigateur fermé, ancienne archive non remplacée', async t => {
+  const logs = t.mock.method(console, 'log', () => {});
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wa-test-'));
+  try {
+    const archive = path.join(tmp, 'session.tar.gz');
+    await fs.writeFile(archive, 'ancienne-session');
+    const client = new EventEmitter();
+    client.pupBrowser = {};
+    client.initialize = async () => client.emit('auth_failure');
+    client.destroy = async () => { client.pupBrowser = null; };
+    await assert.rejects(pairSession(client, tmp, archive), /Authentification WhatsApp refusée/);
+    assert.equal(client.pupBrowser, null);
+    assert.equal(await fs.readFile(archive, 'utf8'), 'ancienne-session');
+    assert.equal(logs.mock.callCount(), 0);
+    const expired = new EventEmitter();
+    expired.pupBrowser = {};
+    expired.initialize = async () => expired.emit('qr', 'qr-ne-pas-afficher');
+    expired.destroy = async () => { expired.pupBrowser = null; };
+    await assert.rejects(pairSession(expired, tmp, archive, false), /Session expirée/);
+    assert.equal(expired.pupBrowser, null);
+    assert.equal(await fs.readFile(archive, 'utf8'), 'ancienne-session');
+    assert.equal(logs.mock.callCount(), 0);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
 });
 
 test('archive privée : données conservées, caches/verrous exclus, extraction possible', async () => {

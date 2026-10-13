@@ -214,26 +214,83 @@ async function connect(client, pairing) {
   await sleep(5000);
 }
 
-async function pair() {
-  if (process.env.CLOUD_RUN_JOB || !process.stdout.isTTY) {
-    throw new Error('pair exige un terminal interactif, jamais une exécution Cloud Run.');
-  }
-  const profile = await fs.mkdtemp(path.join(os.tmpdir(), 'wa-profile-'));
-  const client = makeClient(profile);
+async function getGroups(client) {
+  let groups;
   try {
-    await connect(client, true);
-    const chats = await within(client.getChats(), 30000);
-    console.table(chats.filter(chat => chat.isGroup).map(chat => ({
-      nom: chat.name, GROUP_ID: chat.id._serialized,
+    // getChats/getChatById sérialisent aussi messages et métadonnées : ils peuvent
+    // échouer avec wwebjs 1.34.7. Seuls le nom et l'identifiant nous sont utiles.
+    groups = await within(client.pupPage.evaluate(() => {
+      const chats = window.require('WAWebCollections').Chat.getModelsArray();
+      return chats.filter(chat => chat.groupMetadata).map(chat => ({
+        id: chat.id.toString(), name: chat.formattedTitle,
+      }));
+    }), 30000);
+  } catch (error) {
+    throw new Error(`Lecture des groupes impossible : ${error?.message || String(error)}`, {
+      cause: error,
+    });
+  }
+  if (!Array.isArray(groups)) {
+    throw new Error('Format des groupes WhatsApp incompatible : liste absente, aucun envoi autorisé.');
+  }
+  const invalid = [];
+  for (const [index, group] of groups.entries()) {
+    const validId = typeof group?.id === 'string' && /^[\d-]+@g\.us$/.test(group.id);
+    const validName = typeof group?.name === 'string';
+    if (!validId || !validName) {
+      invalid.push(`index=${index}, idValide=${validId}, typeNom=${typeof group?.name}`);
+      if (invalid.length === 3) break;
+    }
+  }
+  if (invalid.length) {
+    throw new Error(`Format des groupes WhatsApp incompatible : ${invalid.join(' ; ')}. Aucun envoi autorisé.`);
+  }
+  const unnamed = groups.filter(group => !group.name.trim()).length;
+  if (unnamed) log('groups_without_name', { severity: 'WARNING', count: unnamed });
+  return groups;
+}
+
+async function checkGroup(client, id, name) {
+  const group = (await getGroups(client)).find(group => group.id === id);
+  if (!group || !group.name.trim() || group.name !== name) {
+    throw new Error('Groupe incorrect : vérifier GROUP_ID et GROUP_NAME. Aucun envoi.');
+  }
+}
+
+async function pairSession(client, profile, archive, pairing = true) {
+  let ready = false;
+  try {
+    await connect(client, pairing);
+    ready = true;
+    const groups = await getGroups(client);
+    console.table(groups.map(group => ({
+      nom: group.name.trim() ? group.name : '(nom indisponible)', GROUP_ID: group.id,
     })));
   } finally {
     if (client.pupBrowser) await within(client.destroy(), 15000);
+    // Une erreur de lecture ne doit pas perdre un appairage déjà réussi.
+    // L'erreur reste propagée ; session_saved ne signifie pas que pair a réussi.
+    if (ready) {
+      await fs.mkdir(path.dirname(archive), { recursive: true });
+      await packSession(profile, archive);
+      await fs.rm(profile, { recursive: true, force: true });
+      log('session_saved', { file: archive });
+    }
   }
+}
+
+async function localSession(pairing) {
+  if (process.env.CLOUD_RUN_JOB || !process.stdout.isTTY) {
+    throw new Error(`${pairing ? 'pair' : 'groups'} exige un terminal interactif, jamais une exécution Cloud Run.`);
+  }
+  const profile = await fs.mkdtemp(path.join(os.tmpdir(), 'wa-profile-'));
+  const archive = '/secrets/session.tar.gz';
+  if (!pairing) {
+    await exec('tar', ['--no-same-owner', '-xzf', archive, '-C', profile]);
+  }
+  const client = makeClient(profile);
   // /secrets est le montage de .local/ sur le poste, jamais un dossier de l'image.
-  await fs.mkdir('/secrets', { recursive: true });
-  await packSession(profile, '/secrets/session.tar.gz');
-  await fs.rm(profile, { recursive: true, force: true });
-  log('session_saved', { file: '/secrets/session.tar.gz' });
+  await pairSession(client, profile, archive, pairing);
 }
 
 async function run(env = process.env) {
@@ -280,10 +337,7 @@ async function run(env = process.env) {
   try {
     await connect(client, false);
     ready = true;
-    const chat = await within(client.getChatById(env.GROUP_ID), 30000);
-    if (!chat.isGroup || chat.name !== env.GROUP_NAME) {
-      throw new Error('Groupe incorrect : vérifier GROUP_ID et GROUP_NAME. Aucun envoi.');
-    }
+    await checkGroup(client, env.GROUP_ID, env.GROUP_NAME);
     const { Poll } = require('whatsapp-web.js');
     const poll = new Poll(event.question, ['oui', 'non'], { allowMultipleAnswers: false });
     const status = await publishOnce(store, key, () => sendConfirmed(client, env.GROUP_ID, poll));
@@ -306,7 +360,8 @@ async function run(env = process.env) {
 }
 
 async function main(mode = process.argv[2] || 'run') {
-  if (mode === 'pair') return pair();
+  if (mode === 'pair') return localSession(true);
+  if (mode === 'groups') return localSession(false);
   if (mode === 'calendar') {
     const now = new Date(); // Une date de référence, même si minuit passe pendant la boucle.
     console.log('Date,Actif,Titre');
@@ -315,12 +370,15 @@ async function main(mode = process.argv[2] || 'run') {
     }
     return;
   }
-  if (mode !== 'run') throw new Error('Commande attendue : run, pair ou calendar.');
+  if (mode !== 'run') throw new Error('Commande attendue : run, pair, groups ou calendar.');
   await run();
 }
 
 // Importer ce fichier pour les tests ne déclenche ni réseau, ni navigateur.
-module.exports = { dateAfter, selectEvent, publishOnce, sendConfirmed, storage, packSession, run, main };
+module.exports = {
+  dateAfter, selectEvent, publishOnce, sendConfirmed, storage, packSession,
+  getGroups, checkGroup, pairSession, run, main,
+};
 if (require.main === module) {
   main().catch(error => {
     log('error', { message: error?.message || String(error) });
