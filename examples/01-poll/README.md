@@ -23,9 +23,9 @@ docker run --rm -it \
   --entrypoint /usr/bin/tini \
   --user "$(id -u):$(id -g)" -e HOME=/tmp \
   -e GROUP_ID="$GROUP_ID" \
-  -v "$PWD/examples/01-poll:/app:ro" \
+  -v "$PWD:/app:ro" \
   -v "$PWD/.local/poll-example:/secrets" \
-  "$IMAGE" -- node /app/poll-example.cjs
+  "$IMAGE" -- node /app/examples/01-poll/poll-example.cjs
 ```
 
 Scanner le QR dans Android > WhatsApp > Appareils connectes, attendre `ready`,
@@ -48,3 +48,7 @@ node --test examples/01-poll/poll-example.test.cjs
 
 **Resultat observe :** envoi manuel, puis quatre sondages programmes visibles
 dans WhatsApp avec un client continuellement connecte.
+
+La creation et l'envoi du sondage sont maintenant partages avec les phases
+suivantes dans `lib/poll.cjs`. Le montage racine inclut ces modules ; aucun
+appel Google n'est effectue par cet exemple.
