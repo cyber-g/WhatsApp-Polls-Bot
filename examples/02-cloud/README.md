@@ -39,7 +39,7 @@ Les logs `scheduledAt` indiquent la cible, pas l'heure reelle de livraison.
 ## 1. Preparation avant 12h27
 
 Importer la structure actuelle du depot dans Cloud Shell, notamment
-`examples/01-poll`, `examples/02-cloud` et `lib`. Les anciens declencheurs
+`examples/02-cloud` et `lib`. Les anciens declencheurs
 11h10-11h16 et 11h50-11h56 doivent rester suspendus et leurs executions terminees.
 Ne pas relancer le profil Docker local ni aucun autre job utilisant cette
 session pendant ce test.
@@ -73,7 +73,7 @@ si une copie cloud differe :
   grep -Fx "const SLOTS = ['12:30', '12:32', '12:34', '12:36'];" \
     examples/02-cloud/cloud-poll-exercise.cjs
   for file in examples/02-cloud/cloud-poll-exercise.cjs \
-    examples/01-poll/poll-example.cjs lib/runtime.cjs; do
+    lib/poll.cjs lib/runtime.cjs; do
     gcloud storage cp "$file" "gs://$CODE_BUCKET/$file"
     local_hash=$(sha256sum "$file" | cut -d ' ' -f1)
     cloud_output=$(gcloud storage cat "gs://$CODE_BUCKET/$file" | sha256sum)
@@ -193,3 +193,7 @@ node --test examples/02-cloud/cloud-poll-exercise.test.cjs examples/01-poll/poll
 **Resultat observe le 14 octobre 2026 :** quatre sondages visibles dans WhatsApp
 et quatre sequences `ready`, `waiting_for_slot`, `poll_send_completed`,
 `session_saved`, `done`. Cet exercice est historique et sa fenetre est expiree.
+
+Le cycle de session et l'envoi valides sont maintenant partages dans `lib/`
+avec le bot quotidien. Les nouveaux chemins ne remplacent pas automatiquement
+les anciennes copies cloud : un commit ne deploie rien.
