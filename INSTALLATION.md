@@ -194,6 +194,30 @@ La precondition refuse de remplacer une session existante.
 Pour reutiliser la session cloud validee des exercices, suivre la migration,
 **sans recharger l'ancienne archive locale**.
 
+### Remplacer volontairement une session existante
+
+Uniquement apres un **nouvel appairage valide**, termine par `session_saved`
+et une sortie normale : suspendre tous les plannings concernes et attendre
+la fin des executions et conteneurs utilisant cette session.
+La commande suivante **ecrase volontairement l'archive cloud**, sans precondition.
+Ne pas l'utiliser avec une ancienne copie locale pour contourner une erreur.
+
+```bash
+source config.env
+(
+  set -euo pipefail
+  TRACKER_DIR=$(mktemp -d "$PWD/.local/gcloud-upload-XXXXXX")
+  CLOUDSDK_STORAGE_TRACKER_FILES_DIRECTORY="$TRACKER_DIR" \
+    gcloud storage cp .local/daily/session.tar.gz \
+      "gs://$STATE_BUCKET/session.tar.gz"
+)
+```
+
+Le dossier de suivi neuf evite de reprendre un ancien transfert ayant conserve
+une precondition incompatible (`Resuming upload`, puis erreur 412).
+Cette commande ne supprime ni les marqueurs anti-doublon ni les verrous.
+Si le remplacement echoue, ne pas reprendre le planning avant investigation.
+
 ## 5. Charger et verifier le code
 
 Les trois fichiers sont requis, avec leurs chemins :
