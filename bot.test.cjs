@@ -7,7 +7,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const exec = require('node:util').promisify(require('node:child_process').execFile);
-const { dateAfter, dailyWindow, selectEvent, validateConfig, run, main } = require('./bot.cjs');
+const { dateAfter, dailyWindow, selectEvent, validateConfig, identifyGroup, run, main } = require('./bot.cjs');
 const { packSession, storage } = require('./lib/runtime.cjs');
 
 const HEADER = ['Date', 'Actif', 'Titre'];
@@ -62,6 +62,28 @@ test('configuration accepts ID-only destination, safe simulation and rejects inc
     { GROUP_ID: '123@c.us' }, { TIME_ZONE: 'UTC' }, { LEAD_DAYS: '2' }, { DRY_RUN: 'FALSE' }]) {
     assert.throws(() => validateConfig({ ...ENV, ...change }));
   }
+});
+
+test('group discovery reads incoming or own command destination without sending or serializing chats', async t => {
+  t.mock.method(console, 'log', () => {});
+  for (const fromMe of [false, true]) {
+    const client = new EventEmitter();
+    client.sendMessage = () => assert.fail('discovery must not send');
+    client.getChats = () => assert.fail('no chat serialization');
+    const pending = identifyGroup(client, 1000);
+    client.emit('message_create', { body: 'unrelated', from: '999@g.us' });
+    client.emit('message_create', { body: '!groupid', from: '123@c.us' });
+    client.emit('message_create', { body: '!groupid', from: undefined });
+    client.emit('message_create', {
+      body: '!groupid', fromMe, from: fromMe ? 'own@c.us' : '123-456@g.us',
+      to: fromMe ? '123-456@g.us' : 'own@c.us',
+    });
+    assert.equal(await pending, '123-456@g.us');
+    assert.equal(client.listenerCount('message_create'), 0);
+  }
+  const client = new EventEmitter();
+  await assert.rejects(identifyGroup(client, 5), /Delai depasse/);
+  assert.equal(client.listenerCount('message_create'), 0);
 });
 
 async function fixture(t) {
@@ -359,4 +381,5 @@ test('calendar still emits 365 events and removed commands fail explicitly', asy
   assert.equal(output.mock.calls[0].arguments[0], 'Date,Actif,Titre');
   await assert.rejects(main('groups'), /retiré/);
   await assert.rejects(main('pair', { CLOUD_RUN_JOB: 'test' }), /interactif/);
+  await assert.rejects(main('group-id', { CLOUD_RUN_JOB: 'test' }), /interactif/);
 });

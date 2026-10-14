@@ -124,8 +124,29 @@ async function run(env = process.env, dependencies = {}) {
   }, dependencies);
 }
 
-async function pair(env = process.env) {
-  if (env.CLOUD_RUN_JOB || !process.stdout.isTTY) throw new Error('pair exige un terminal interactif hors Cloud Run.');
+async function identifyGroup(client, timeout = 180000) {
+  let onMessage;
+  try {
+    return await bounded(new Promise(resolve => {
+      onMessage = message => {
+        if (message.body !== '!groupid') return;
+        const id = message.fromMe ? message.to : message.from;
+        if (typeof id !== 'string' || !/^[\d-]+@g\.us$/.test(id)) {
+          log('command_rejected', { reason: 'group_id_unavailable_or_private_chat' });
+          return;
+        }
+        resolve(id);
+      };
+      client.on('message_create', onMessage);
+      log('awaiting_group_id', { message: 'Envoyer !groupid dans le groupe cible ; aucun message ne sera publie par le bot.' });
+    }), timeout);
+  } finally {
+    client.off('message_create', onMessage);
+  }
+}
+
+async function pair(env = process.env, identify = false) {
+  if (env.CLOUD_RUN_JOB || !process.stdout.isTTY) throw new Error('pair/group-id exige un terminal interactif hors Cloud Run.');
   const profile = path.join('/secrets', 'profile');
   const client = makeClient(profile);
   let ready = false;
@@ -134,6 +155,10 @@ async function pair(env = process.env) {
       log('scan_qr', { message: 'QR sensible : scanner sur Android, ne pas partager.' });
       require('qrcode-terminal').generate(code, { small: true });
     });
+    if (identify) {
+      const groupId = await identifyGroup(client);
+      log('group_id', { GROUP_ID: groupId });
+    }
     ready = true;
   } finally {
     if (client.pupBrowser) await bounded(client.destroy(), 10000);
@@ -147,16 +172,17 @@ async function pair(env = process.env) {
 async function main(mode = process.argv[2] || 'run', env = process.env) {
   if (mode === 'run') return run(env);
   if (mode === 'pair') return pair(env);
+  if (mode === 'group-id') return pair(env, true);
   if (mode === 'calendar') {
     const now = new Date();
     console.log('Date,Actif,Titre');
     for (let day = 1; day <= 365; day++) console.log(`${dateAfter(day, now)},OUI,${DEFAULT_TITLE}`);
     return;
   }
-  throw new Error('Commande attendue : run, pair ou calendar. Le mode groups a été retiré.');
+  throw new Error('Commande attendue : run, pair, group-id ou calendar. Le mode groups a été retiré.');
 }
 
-module.exports = { dateAfter, dailyWindow, selectEvent, readSheet, validateConfig, run, main };
+module.exports = { dateAfter, dailyWindow, selectEvent, readSheet, validateConfig, identifyGroup, run, main };
 if (require.main === module) {
   main().catch(error => {
     log('error', { message: error?.message || String(error), stage: error.stage });

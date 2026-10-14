@@ -19,7 +19,9 @@ mkdir -p .local
 chmod 700 .local
 ```
 
-Configurer `PROJECT_ID`, `REGION`, `SPREADSHEET_ID` et `GROUP_ID`. Conserver :
+Configurer seulement `PROJECT_ID` et `REGION` a ce stade.
+Laisser `SPREADSHEET_ID` et `GROUP_ID` vides : ils seront renseignes
+respectivement aux **etapes 3 et 4**, avant le deploiement. Conserver :
 
 ```bash
 DRY_RUN='true'
@@ -108,8 +110,19 @@ docker run --rm -v "$PWD:/app:ro" "$IMAGE" calendar > .local/calendrier.csv
 ```
 
 Partager le tableur comme **Lecteur** avec l'adresse `$READER`, sans le rendre
-public. Renseigner l'identifiant du tableur (pas l'URL ni le gid) dans
-`SPREADSHEET_ID`.
+public. Dans l'URL du tableur ouvert depuis Drive :
+
+```text
+https://docs.google.com/spreadsheets/d/IDENTIFIANT_DU_TABLEUR/edit...
+```
+
+Copier uniquement la partie entre `/d/` et `/edit` dans `config.env` :
+
+```bash
+SPREADSHEET_ID='identifiant-copie-depuis-url'
+```
+
+Ce n'est ni l'URL complete ni le `gid` de l'onglet. Refaire `source config.env`.
 
 ## 4. Session WhatsApp
 
@@ -126,9 +139,51 @@ docker run --rm -it \
 
 Sur Android : WhatsApp > Appareils connectes > Connecter un appareil.
 Scanner le QR, attendre `ready`, puis `session_saved` et la sortie normale.
-Le mode `pair` n'envoie rien et ne lit pas les groupes. Configurer avec soin
-`GROUP_ID` (`@g.us`) : le nom du groupe n'est plus controle. `groups` a ete retire.
+Le mode `pair` n'envoie rien et ne lit pas les groupes.
 Le profil et l'archive sont sensibles ; ne jamais les joindre aux logs.
+
+### Obtenir GROUP_ID
+
+L'identifiant technique n'est pas le nom du groupe, un numero de telephone
+ou son lien d'invitation. Le compte appaire doit etre membre du groupe cible.
+Apres la fin de `pair`, lancer depuis la racine du depot :
+
+```bash
+docker run --rm -it \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD:/app:ro" -v "$PWD/.local/daily:/secrets" \
+  "$IMAGE" group-id
+```
+
+Cette commande reutilise le profil local de l'etape precedente et ne demande
+pas `GROUP_ID`. Si un QR est demande, le scanner comme pour `pair`.
+Attendre **`awaiting_group_id`**, puis envoyer exactement **`!groupid`**
+depuis Android dans le **groupe cible**, avec le compte du bot ou un participant.
+Ne pas l'envoyer en conversation privee. Le programme lit uniquement `from`
+ou `to` du message ; il n'appelle ni `getChats()` ni `getChat()`.
+Il ne publie aucun message ou sondage. Il affiche par exemple :
+
+```json
+{"event":"group_id","GROUP_ID":"123456789@g.us"}
+```
+
+Copier l'identifiant complet, suffixe **`@g.us` inclus**, dans `config.env` :
+
+```bash
+GROUP_ID='identifiant-complet-copie@g.us'
+```
+
+L'exemple ci-dessus n'est pas un identifiant a reutiliser. Verifier le groupe
+dans lequel la commande a ete envoyee : le nom du groupe n'est pas controle.
+Attendre `session_saved` et la fin normale avant de charger l'archive :
+`group-id` ferme Chrome et actualise l'archive apres la lecture.
+Sans commande valide en trois minutes, il termine en erreur ; corriger
+la cause avant de relancer. `groups`, l'ancien mode de liste, reste retire.
+Refaire `source config.env` apres avoir renseigne les deux identifiants.
+
+Ne jamais lancer cette commande sur une ancienne copie locale d'une session
+deja utilisee dans le cloud : cette procedure concerne une installation neuve,
+avant le premier chargement.
 
 ```bash
 gcloud storage cp --if-generation-match=0 .local/daily/session.tar.gz \
