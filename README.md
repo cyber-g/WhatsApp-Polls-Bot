@@ -8,7 +8,7 @@ du lendemain defini dans Google Sheets. Choix `oui` / `non`, reponse unique.
 1. **[Sondage simple](examples/01-poll/README.md)** :
    repartir de l'exemple officiel `!sendpoll`, valider l'envoi manuel puis
    quatre publications avec une connexion continue.
-2. **[Exercice Cloud Run](CLOUD-POLL-EXERCISE.md)** :
+2. **[Exercice Cloud Run](examples/02-cloud/README.md)** :
    valider quatre executions independantes, la restauration et la sauvegarde
    successive de la session, avec demarrage anticipe.
 3. **Bot quotidien** : `bot.cjs`, Google Sheets et anti-doublon durable.
