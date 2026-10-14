@@ -1,36 +1,10 @@
 'use strict';
 
 const path = require('node:path');
+const { messageKey, sendPoll } = require('../../lib/poll.cjs');
 
 function log(event, details = {}) {
   console.log(JSON.stringify({ event, ...details }));
-}
-
-function messageKey(message, groupId) {
-  const id = message?.id;
-  if (typeof id?._serialized === 'string' && id._serialized) return id._serialized;
-  if (typeof id?.id === 'string' && id.id) return `${groupId}:${id.id}`;
-  return null;
-}
-
-async function sendPoll(client, Poll, groupId, details = {}) {
-  let stage = 'create_poll';
-  try {
-    const poll = new Poll('TEST : present ?', ['oui', 'non'], {
-      allowMultipleAnswers: false,
-    });
-    stage = 'send_poll';
-    const sent = await client.sendMessage(groupId, poll, {
-      sendSeen: false, waitUntilMsgSent: true,
-    });
-    log('poll_send_completed', {
-      ...details,
-      responseHasId: messageKey(sent, groupId) !== null,
-      message: 'Appel termine sans erreur ; verifier le sondage dans WhatsApp.',
-    });
-  } catch (error) {
-    throw Object.assign(new Error(error?.message || String(error), { cause: error }), { stage });
-  }
 }
 
 const SCHEDULE = ['10:10', '10:13', '10:16', '10:19'].map(time =>
