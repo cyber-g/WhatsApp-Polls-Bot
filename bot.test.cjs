@@ -1,366 +1,362 @@
 'use strict';
 
-// Tests natifs Node : ni npm install, ni compte Google, ni connexion WhatsApp.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
-const vm = require('node:vm');
 const exec = require('node:util').promisify(require('node:child_process').execFile);
-const {
-  dateAfter, selectEvent, publishOnce, sendConfirmed, storage, packSession,
-  getGroups, checkGroup, pairSession, run, main,
-} = require('./bot.cjs');
+const { dateAfter, dailyWindow, selectEvent, validateConfig, run, main } = require('./bot.cjs');
+const { packSession, storage } = require('./lib/runtime.cjs');
+
 const HEADER = ['Date', 'Actif', 'Titre'];
 const ENV = {
-  SPREADSHEET_ID: 'sheet', SHEETS_READER: 'reader', STATE_BUCKET: 'bucket',
-  GROUP_ID: '123@g.us', GROUP_NAME: 'test', DRY_RUN: 'true',
+  CLOUD_RUN_JOB: 'daily-test', SPREADSHEET_ID: 'sheet', SHEETS_READER: 'reader',
+  STATE_BUCKET: 'bucket', GROUP_ID: '123@g.us', DRY_RUN: 'false',
 };
 
-// Faux stockage atomique : suffisant pour tester notre protection, pas GCS lui-même.
-function fakeStore() {
-  const files = new Map();
-  return {
-    files,
-    async put(key, body, generation) {
-      if (generation === 0 && files.has(key)) {
-        throw Object.assign(new Error('existe'), { status: 412 });
-      }
-      files.set(key, JSON.parse(body));
-      return { generation: '1' };
-    },
-  };
-}
-
-function fakeGoogle(t, values, rest = []) {
-  const calls = [];
-  const responses = [
-    { access_token: 'token-factice' }, { accessToken: 'sheets-factice' }, { values }, ...rest,
-  ];
-  t.mock.method(console, 'log', () => {});
-  t.mock.method(globalThis, 'fetch', async (url, options) => {
-    calls.push({ url: String(url), options });
-    const result = responses.shift();
-    assert.notEqual(result, undefined, 'Appel réseau supplémentaire inattendu');
-    if (result instanceof Response) return result;
-    return new Response(JSON.stringify(result));
-  });
-  return calls;
-}
-
-test('demain à Paris, indépendamment du fuseau du serveur', () => {
-  assert.equal(dateAfter(1, new Date('2026-10-13T23:30:00Z')), '2026-10-15');
+test('calendar days and 09:00 Paris across midnight, DST, leap year and year end', () => {
+  for (const [instant, tomorrow, start] of [
+    ['2026-10-13T23:30:00Z', '2026-10-15', '2026-10-14T07:00:00Z'],
+    ['2026-03-28T12:00:00Z', '2026-03-29', '2026-03-28T08:00:00Z'],
+    ['2026-03-29T12:00:00Z', '2026-03-30', '2026-03-29T07:00:00Z'],
+    ['2026-10-25T12:00:00Z', '2026-10-26', '2026-10-25T08:00:00Z'],
+    ['2026-12-31T12:00:00Z', '2027-01-01', '2026-12-31T08:00:00Z'],
+    ['2028-02-28T12:00:00Z', '2028-02-29', '2028-02-28T08:00:00Z'],
+  ]) {
+    const date = new Date(instant);
+    assert.equal(dateAfter(1, date), tomorrow);
+    const window = dailyWindow(date);
+    assert.equal(window.start, Date.parse(start));
+    assert.equal(window.start - window.prepare, 180000);
+    assert.equal(window.end - window.start, 900000);
+  }
   assert.equal(dateAfter(1, new Date('2026-10-13T23:30:00Z'), 'UTC'), '2026-10-14');
 });
 
-test('jours calendaires aux changements d’heure et d’année, y compris année bissextile', () => {
-  assert.equal(dateAfter(1, new Date('2026-03-28T22:30:00Z')), '2026-03-29');
-  assert.equal(dateAfter(1, new Date('2026-03-29T22:30:00Z')), '2026-03-31');
-  assert.equal(dateAfter(1, new Date('2026-10-25T22:30:00Z')), '2026-10-26');
-  assert.equal(dateAfter(1, new Date('2026-12-31T12:00:00Z')), '2027-01-01');
-  assert.equal(dateAfter(1, new Date('2028-02-28T12:00:00Z')), '2028-02-29');
-  assert.equal(dateAfter(2, new Date('2026-10-14T07:00:00Z')), '2026-10-16');
-});
-
-test('titre personnalisé et remplacement de la date', () => {
-  assert.deepEqual(selectEvent([HEADER, ['2026-10-16', 'OUI', 'Préparation Dan du {date}']], '2026-10-16'), {
-    date: '2026-10-16', question: 'Préparation Dan du 16/10/2026',
+test('Sheets selects tomorrow, expands the title, defaults and skips inactive/absent events', () => {
+  const date = '2026-10-15';
+  assert.deepEqual(selectEvent([HEADER, [date, ' oui ', 'Cours du {date}']], date), {
+    date, question: 'Cours du 15/10/2026',
   });
+  assert.equal(selectEvent([HEADER, [date, 'OUI']], date).question,
+    'TEST — Événement du 15/10/2026 : présent ?');
+  assert.equal(selectEvent([HEADER, [date, 'NON']], date), null);
+  assert.equal(selectEvent([HEADER], date), null);
 });
 
-test('titre de test par défaut et dates inactives ou absentes', () => {
-  assert.equal(selectEvent([HEADER, ['2026-10-16', ' oui ']], '2026-10-16').question,
-    'TEST — Événement du 16/10/2026 : présent ?');
-  assert.equal(selectEvent([HEADER, ['2026-10-16', 'NON']], '2026-10-16'), null);
-  assert.equal(selectEvent([HEADER], '2026-10-16'), null);
+test('malformed Sheets data, impossible dates and duplicate active dates are explicit errors', () => {
+  for (const rows of [[], null, {}, [HEADER, null], [['Wrong', 'Actif', 'Titre']],
+    [HEADER, [46311, 'OUI']], [HEADER, ['15/10/2026', 'OUI']],
+    [HEADER, ['2026-02-30', 'OUI']], [HEADER, ['2026-13-01', 'OUI']],
+    [HEADER, ['2026-10-15', 'OUI'], ['2026-10-15', 'OUI']]]) {
+    assert.throws(() => selectEvent(rows, '2026-10-15'));
+  }
 });
 
-test('refus des doubles événements actifs, mauvais en-têtes et dates converties', () => {
-  const row = ['2026-10-16', 'OUI'];
-  assert.throws(() => selectEvent([HEADER, row, row], '2026-10-16'), /Deux événements/);
-  assert.throws(() => selectEvent([], '2026-10-16'), /En-têtes/);
-  assert.throws(() => selectEvent([HEADER, [46311, 'OUI']], '2026-10-16'), /TEXTE/);
-  assert.throws(() => selectEvent([HEADER, ['16\/10\/2026', 'OUI']], '2026-10-16'), /TEXTE/);
+test('configuration accepts ID-only destination, safe simulation and rejects incompatible legacy settings', () => {
+  validateConfig(ENV);
+  validateConfig({ ...ENV, DRY_RUN: undefined });
+  for (const change of [{ SPREADSHEET_ID: '' }, { SHEETS_READER: '' }, { STATE_BUCKET: '' },
+    { GROUP_ID: '123@c.us' }, { TIME_ZONE: 'UTC' }, { LEAD_DAYS: '2' }, { DRY_RUN: 'FALSE' }]) {
+    assert.throws(() => validateConfig({ ...ENV, ...change }));
+  }
 });
 
-test('marqueur posé avant envoi ; deux tentatives simultanées ne publient qu’une fois', async () => {
-  const store = fakeStore();
-  let sends = 0;
-  const send = async () => {
-    assert.equal(store.files.get('day').status, 'pending');
-    sends++;
-    return 'message-123';
+async function fixture(t) {
+  const logs = t.mock.method(console, 'log', () => {});
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wa-daily-test-'));
+  t.after(() => fs.rm(tmp, { recursive: true, force: true }));
+  const source = path.join(tmp, 'source');
+  const archive = path.join(tmp, 'input.tar.gz');
+  await fs.mkdir(source);
+  await fs.writeFile(path.join(source, 'state'), 'initial');
+  await packSession(source, archive);
+  const objects = new Map([['session.tar.gz', {
+    bytes: await fs.readFile(archive), generation: '1',
+  }]]);
+  let generation = 1;
+  const f = {
+    tmp, source, objects, calls: [], sends: [], closes: 0, profiles: [],
+    eventDate: '2026-10-15',
+    values: [HEADER, ['2026-10-15', 'OUI', 'Cours du {date}']],
+    clock: Date.parse('2026-10-14T06:57:00Z'),
+    events: () => logs.mock.calls.map(call => JSON.parse(call.arguments[0])),
   };
-  const results = await Promise.all([publishOnce(store, 'day', send), publishOnce(store, 'day', send)]);
-  assert.equal(sends, 1);
-  assert.deepEqual(results.sort(), ['already_recorded', 'sent']);
-  assert.equal(store.files.get('day').messageId, 'message-123');
-});
-
-test('une tentative incertaine reste pending et n’est pas rejouée', async () => {
-  const store = fakeStore();
-  await assert.rejects(publishOnce(store, 'day', async () => { throw new Error('réseau'); }), /réseau/);
-  assert.equal(store.files.get('day').status, 'pending');
-  assert.equal(await publishOnce(store, 'day', () => assert.fail('ne pas renvoyer')), 'already_recorded');
-});
-
-test('une erreur de permission n’est pas considérée comme un doublon', async () => {
-  const store = { put: async () => { throw Object.assign(new Error('interdit'), { status: 403 }); } };
-  await assert.rejects(publishOnce(store, 'day', () => assert.fail('ne pas envoyer')), /interdit/);
-});
-
-test('confirmation serveur reçue avant le retour de sendMessage ; nettoyage des listeners', async () => {
-  const client = new EventEmitter();
-  const message = { id: { _serialized: 'message' }, ack: 0 };
-  client.sendMessage = async (group, poll, options) => {
-    assert.equal(options.sendSeen, false);
-    client.emit('message_ack', message, 1);
-    return message;
+  t.mock.method(globalThis, 'fetch', async (urlString, options = {}) => {
+    const url = new URL(urlString);
+    f.calls.push({ url, options });
+    if (url.hostname === 'metadata.google.internal') {
+      assert.equal(options.headers['Metadata-Flavor'], 'Google');
+      return new Response(JSON.stringify({ access_token: 'fake-token' }));
+    }
+    if (url.hostname === 'iamcredentials.googleapis.com') {
+      assert.equal(options.headers.Authorization, 'Bearer fake-token');
+      assert.deepEqual(JSON.parse(options.body).scope,
+        ['https://www.googleapis.com/auth/spreadsheets.readonly']);
+      return new Response(JSON.stringify({ accessToken: 'fake-sheets' }));
+    }
+    if (url.hostname === 'sheets.googleapis.com') {
+      assert.equal(options.headers.Authorization, 'Bearer fake-sheets');
+      assert.equal(url.searchParams.get('valueRenderOption'), 'UNFORMATTED_VALUE');
+      return new Response(JSON.stringify({ values: f.values }));
+    }
+    assert.equal(url.hostname, 'storage.googleapis.com');
+    const key = url.pathname.startsWith('/upload/') ? url.searchParams.get('name') :
+      decodeURIComponent(url.pathname.split('/o/')[1]);
+    const old = objects.get(key);
+    if (options.method === 'POST' || options.method === 'DELETE') {
+      if (f.failSave && key === 'session.tar.gz') return new Response('', { status: 403 });
+      if (f.expireOnReservation && key.startsWith('polls/') &&
+        url.searchParams.get('ifGenerationMatch') === '0') {
+        f.clock = Date.parse('2026-10-14T07:15:00Z');
+      }
+      const expected = url.searchParams.get('ifGenerationMatch');
+      if (expected !== null &&
+        ((expected === '0' && old) || (expected !== '0' && expected !== old?.generation))) {
+        return new Response('', { status: 412 });
+      }
+      if (options.method === 'DELETE') {
+        objects.delete(key);
+        return new Response(null, { status: 204 });
+      }
+      const record = { bytes: Buffer.from(options.body), generation: String(++generation) };
+      objects.set(key, record);
+      return new Response(JSON.stringify({ generation: record.generation }));
+    }
+    return old ? new Response(old.bytes) : new Response('', { status: 404 });
+  });
+  f.dependencies = {
+    now: () => f.clock,
+    wait: async milliseconds => {
+      f.clock += milliseconds;
+      if (f.disconnectWhileWaiting) f.client.emit('disconnected');
+    },
+    Poll: class {
+      constructor(question, options, settings) { Object.assign(this, { question, options, settings }); }
+    },
+    createClient(profile) {
+      f.profiles.push(profile);
+      const client = new EventEmitter();
+      f.client = client;
+      client.pupBrowser = {};
+      client.initialize = async () => {
+        assert.equal(await fs.readFile(path.join(profile, 'state'), 'utf8'), f.expectedState || 'initial');
+        if (f.expireOnReady) f.clock = Date.parse('2026-10-14T07:15:00Z');
+        client.emit(f.expiredAuth ? 'qr' : 'ready');
+      };
+      client.getChatById = () => assert.fail('no group serialization');
+      client.sendMessage = async (...args) => {
+        const marker = objects.get(`polls/123@g.us/${f.eventDate}.json`);
+        assert.equal(JSON.parse(marker.bytes).status, 'pending');
+        const window = dailyWindow(new Date(f.clock));
+        assert.ok(f.clock >= window.start);
+        assert.ok(f.clock < window.end);
+        f.sends.push(args);
+        if (f.failSend) throw new Error('uncertain');
+        return undefined;
+      };
+      client.destroy = async () => {
+        f.closes++;
+        await fs.writeFile(path.join(profile, 'state'), 'updated');
+      };
+      return client;
+    },
   };
-  assert.equal(await sendConfirmed(client, '123@g.us', {}), 'message');
-  assert.equal(client.listenerCount('message_ack'), 0);
+  return f;
+}
+
+test('daily run prepares early, waits until 09:00, sends tomorrow title without response ID, closes and saves', async t => {
+  const f = await fixture(t);
+  await run(ENV, f.dependencies);
+  assert.equal(f.clock, Date.parse('2026-10-14T07:00:00Z'));
+  assert.equal(f.sends.length, 1);
+  const [destination, poll, options] = f.sends[0];
+  assert.equal(destination, ENV.GROUP_ID);
+  assert.equal(poll.question, 'Cours du 15/10/2026');
+  assert.deepEqual(poll.options, ['oui', 'non']);
+  assert.deepEqual(poll.settings, { allowMultipleAnswers: false });
+  assert.deepEqual(options, { sendSeen: false, waitUntilMsgSent: true });
+  assert.equal(f.closes, 1);
+  assert.equal(f.objects.has('lock.json'), false);
+  const marker = JSON.parse(f.objects.get('polls/123@g.us/2026-10-15.json').bytes);
+  assert.equal(marker.status, 'call_completed');
+  assert.equal(marker.responseHasId, false);
+  const restored = path.join(f.tmp, 'verify');
+  await fs.mkdir(restored);
+  const saved = path.join(restored, 'saved.tar.gz');
+  await fs.writeFile(saved, f.objects.get('session.tar.gz').bytes);
+  await exec('tar', ['--no-same-owner', '-xzf', saved, '-C', restored]);
+  assert.equal(await fs.readFile(path.join(restored, 'state'), 'utf8'), 'updated');
+  await assert.rejects(fs.stat(f.profiles[0]), { code: 'ENOENT' });
+  assert.ok(f.events().some(event => event.event === 'waiting_for_slot'));
+  await run(ENV, f.dependencies);
+  assert.equal(f.sends.length, 1);
+  assert.equal(f.profiles.length, 1);
 });
 
-test('refus serveur ou absence de message : erreur, pas de succès fictif', async () => {
-  const client = new EventEmitter();
-  client.sendMessage = async () => ({ id: { _serialized: 'message' }, ack: -1 });
-  await assert.rejects(sendConfirmed(client, '123@g.us', {}), /refuse/);
-  client.sendMessage = async () => undefined;
-  await assert.rejects(sendConfirmed(client, '123@g.us', {}), /renvoie pas/);
-  assert.equal(client.listenerCount('message_ack'), 0);
+test('safe simulation works outside publication hours and never touches state or browser', async t => {
+  const f = await fixture(t);
+  f.clock = Date.parse('2026-10-14T12:00:00Z');
+  await run({ ...ENV, DRY_RUN: undefined }, f.dependencies);
+  assert.equal(f.calls.length, 3);
+  assert.equal(f.profiles.length, 0);
+  assert.ok(f.events().some(event => event.event === 'dry_run'));
 });
 
-test('préconditions et encodage des objets transmis à GCS', async t => {
+test('the next daily execution restores the saved session and reserves the next event without deleting history', async t => {
+  const f = await fixture(t);
+  await run(ENV, f.dependencies);
+  const firstMarker = f.objects.get('polls/123@g.us/2026-10-15.json');
+  f.clock = Date.parse('2026-10-15T06:57:00Z');
+  f.eventDate = '2026-10-16';
+  f.values = [HEADER, [f.eventDate, 'OUI', 'Cours du {date}']];
+  f.expectedState = 'updated';
+  await run(ENV, f.dependencies);
+  assert.equal(f.sends.length, 2);
+  assert.equal(f.sends[1][1].question, 'Cours du 16/10/2026');
+  assert.equal(f.objects.get('polls/123@g.us/2026-10-15.json'), firstMarker);
+  assert.equal(JSON.parse(f.objects.get('polls/123@g.us/2026-10-16.json').bytes).status, 'call_completed');
+  assert.equal(f.closes, 2);
+  assert.equal(f.objects.has('lock.json'), false);
+});
+
+test('missing Google tokens, permission failures and malformed Sheets responses are not silent no-event results', async t => {
+  t.mock.method(console, 'log', () => {});
+  const now = () => Date.parse('2026-10-14T06:57:00Z');
+  for (const responses of [
+    [{}],
+    [{ access_token: 'fake' }, {}],
+    [new Response('', { status: 403 })],
+    [{ access_token: 'fake' }, { accessToken: 'sheets' }, { values: {} }],
+  ]) {
+    const network = t.mock.method(globalThis, 'fetch', async () => {
+      const result = responses.shift();
+      assert.notEqual(result, undefined);
+      return result instanceof Response ? result : new Response(JSON.stringify(result));
+    });
+    await assert.rejects(run(ENV, { now, createClient: () => assert.fail('no browser') }));
+    network.mock.restore();
+  }
+});
+
+test('no active event never opens WhatsApp or accesses state', async t => {
+  const f = await fixture(t);
+  f.values = [HEADER, ['2026-10-15', 'NON']];
+  await run(ENV, f.dependencies);
+  assert.equal(f.calls.length, 3);
+  assert.equal(f.profiles.length, 0);
+  assert.ok(f.events().some(event => event.event === 'no_event'));
+});
+
+test('real run outside 08:57-09:15 never accesses network; non-Cloud Run publication is rejected', async t => {
+  const f = await fixture(t);
+  for (const instant of ['2026-10-14T06:56:59Z', '2026-10-14T07:15:00Z']) {
+    f.clock = Date.parse(instant);
+    await run(ENV, f.dependencies);
+  }
+  assert.equal(f.calls.length, 0);
+  await assert.rejects(run({ ...ENV, CLOUD_RUN_JOB: undefined }, f.dependencies), /Cloud Run Job/);
+});
+
+test('old sent and pending markers prevent another publication without changing history', async t => {
+  const f = await fixture(t);
+  for (const status of ['sent', 'pending', 'call_completed']) {
+    const key = 'polls/123@g.us/2026-10-15.json';
+    const record = { bytes: Buffer.from(JSON.stringify({ status })), generation: '99' };
+    f.objects.set(key, record);
+    await run(ENV, f.dependencies);
+    assert.equal(f.objects.get(key), record);
+  }
+  assert.equal(f.profiles.length, 0);
+});
+
+test('late start is allowed before 09:15 without waiting for another day', async t => {
+  const f = await fixture(t);
+  f.clock = Date.parse('2026-10-14T07:14:59Z');
+  await run(ENV, f.dependencies);
+  assert.equal(f.sends.length, 1);
+  assert.equal(f.clock, Date.parse('2026-10-14T07:14:59Z'));
+});
+
+test('deadline reached during connection or reservation skips sending and preserves the closed session', async t => {
+  const f = await fixture(t);
+  f.expireOnReady = true;
+  await run(ENV, f.dependencies);
+  assert.equal(f.sends.length, 0);
+  assert.equal(f.objects.has('lock.json'), false);
+  f.expireOnReady = false;
+  f.expireOnReservation = true;
+  f.expectedState = 'updated';
+  f.clock = Date.parse('2026-10-14T07:00:00Z');
+  await run(ENV, f.dependencies);
+  assert.equal(f.sends.length, 0);
+  assert.equal(JSON.parse(f.objects.get('polls/123@g.us/2026-10-15.json').bytes).status, 'expired');
+});
+
+test('uncertain send keeps pending marker, old session and lock without retry', async t => {
+  const f = await fixture(t);
+  const oldSession = f.objects.get('session.tar.gz');
+  f.failSend = true;
+  await assert.rejects(run(ENV, f.dependencies), /uncertain/);
+  assert.equal(f.sends.length, 1);
+  assert.equal(f.closes, 1);
+  assert.equal(f.objects.get('session.tar.gz'), oldSession);
+  assert.equal(f.objects.has('lock.json'), true);
+  assert.equal(JSON.parse(f.objects.get('polls/123@g.us/2026-10-15.json').bytes).status, 'pending');
+  await run(ENV, f.dependencies);
+  assert.equal(f.sends.length, 1);
+});
+
+test('expired auth, disconnection while waiting, missing archive and save failure all retain the lock', async t => {
+  for (const failure of ['expiredAuth', 'disconnectWhileWaiting', 'missingArchive', 'failSave']) {
+    await t.test(failure, async t => {
+      const f = await fixture(t);
+      if (failure === 'missingArchive') f.objects.delete('session.tar.gz');
+      else f[failure] = true;
+      await assert.rejects(run(ENV, f.dependencies));
+      assert.equal(f.objects.has('lock.json'), true);
+      assert.equal(f.events().some(event => event.event === 'done'), false);
+      assert.equal(f.sends.length, failure === 'failSave' ? 1 : 0);
+      for (const profile of f.profiles) await assert.rejects(fs.stat(profile), { code: 'ENOENT' });
+    });
+  }
+});
+
+test('private archive excludes singleton locks and caches; REST preserves atomic preconditions and real errors', async t => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.source, 'session', 'Default', 'Cache'), { recursive: true });
+  await fs.writeFile(path.join(f.source, 'session', 'Default', 'Cache', 'cache'), 'discard');
+  await fs.writeFile(path.join(f.source, 'session', 'Default', 'IndexedDB'), 'keep');
+  await fs.symlink('old-host', path.join(f.source, 'session', 'SingletonLock'));
+  const archive = path.join(f.tmp, 'private.tar.gz');
+  await packSession(f.source, archive);
+  const { stdout } = await exec('tar', ['-tzf', archive]);
+  assert.match(stdout, /IndexedDB/);
+  assert.doesNotMatch(stdout, /Singleton|Cache/);
+  assert.equal((await fs.stat(archive)).mode & 0o777, 0o600);
   const calls = [];
-  t.mock.method(globalThis, 'fetch', async (url, options) => {
+  const network = t.mock.method(globalThis, 'fetch', async (url, options) => {
     calls.push({ url: new URL(url), options });
     return new Response(JSON.stringify({ generation: '321' }));
   });
-  const store = storage('bucket', 'token-factice');
-  await store.put('polls/123@g.us/2026-10-16.json', '{}', 0);
+  const store = storage('bucket', 'fake');
+  await store.put('polls/123@g.us/2026-10-15.json', '{}', 0);
   await store.remove('lock.json', '321');
   assert.equal(calls[0].url.searchParams.get('ifGenerationMatch'), '0');
-  assert.equal(calls[0].url.searchParams.get('name'), 'polls/123@g.us/2026-10-16.json');
   assert.equal(calls[1].url.searchParams.get('ifGenerationMatch'), '321');
-  assert.equal(calls[1].options.method, 'DELETE');
+  network.mock.mockImplementation(async () => new Response('', { status: 404 }));
+  assert.equal(await store.get('missing'), null);
+  network.mock.mockImplementation(async () => new Response('', { status: 403 }));
+  await assert.rejects(store.get('forbidden'), /HTTP 403/);
 });
 
-test('un objet absent est distinct d’un objet inaccessible', async t => {
-  const mock = t.mock.method(globalThis, 'fetch', async () => new Response('', { status: 404 }));
-  const store = storage('bucket', 'token-factice');
-  assert.equal(await store.get('absent'), null);
-  mock.mock.mockImplementation(async () => new Response('', { status: 403 }));
-  await assert.rejects(store.get('interdit'), /HTTP 403/);
-});
-
-test('simulation : lecture Sheets privée, pas de stockage ni de navigateur', async t => {
-  const calls = fakeGoogle(t, [HEADER, [dateAfter(1), 'OUI']]);
-  await run(ENV);
-  assert.equal(calls.length, 3);
-  assert.match(calls[2].url, /valueRenderOption=UNFORMATTED_VALUE/);
-  assert.deepEqual(JSON.parse(calls[1].options.body).scope,
-    ['https://www.googleapis.com/auth/spreadsheets.readonly']);
-  assert.equal(calls[2].options.headers.Authorization, 'Bearer sheets-factice');
-});
-
-test('sans DRY_RUN explicite, le comportement reste la simulation', async t => {
-  const calls = fakeGoogle(t, [HEADER, [dateAfter(1), 'OUI']]);
-  await run({ ...ENV, DRY_RUN: undefined });
-  assert.equal(calls.length, 3);
-});
-
-test('aucun événement : pas de stockage ni de navigateur, même en mode réel', async t => {
-  const calls = fakeGoogle(t, [HEADER]);
-  await run({ ...ENV, DRY_RUN: 'false' });
-  assert.equal(calls.length, 3);
-});
-
-test('déjà enregistré : pas de nouvelle connexion WhatsApp ni de verrou supplémentaire', async t => {
-  const calls = fakeGoogle(t, [HEADER, [dateAfter(1), 'OUI']], [{ status: 'pending' }]);
-  await run({ ...ENV, DRY_RUN: 'false' });
-  assert.equal(calls.length, 4);
-});
-
-test('verrou occupé : arrêt explicite avant de lire la session', async t => {
-  const calls = fakeGoogle(t, [HEADER, [dateAfter(1), 'OUI']], [
-    new Response('', { status: 404 }), new Response('', { status: 412 }),
-  ]);
-  await assert.rejects(run({ ...ENV, DRY_RUN: 'false' }), /Verrou présent/);
-  assert.equal(calls.length, 5);
-});
-
-test('mauvaise configuration refusée avant tout réseau', async t => {
-  t.mock.method(globalThis, 'fetch', () => assert.fail('aucun réseau attendu'));
-  await assert.rejects(run({}), /Configuration manquante/);
-  await assert.rejects(run({ ...ENV, GROUP_ID: '123@c.us' }), /groupe/);
-  await assert.rejects(run({ ...ENV, LEAD_DAYS: 'abc' }), /LEAD_DAYS/);
-});
-
-test('lecture légère : groupes seulement, sans sérialiser les discussions ou messages', async () => {
-  const group = {
-    groupMetadata: {}, id: { toString: () => '123-456@g.us' }, formattedTitle: 'TEST bot sondages',
-    serialize: () => assert.fail('ne pas sérialiser le groupe'),
-    get lastReceivedKey() { assert.fail('ne pas lire les messages'); },
-  };
-  const client = {
-    getChats: () => assert.fail('ne pas appeler getChats'),
-    getChatById: () => assert.fail('ne pas appeler getChatById'),
-    pupPage: {
-      async evaluate(reader) {
-        const result = vm.runInNewContext(`(${reader.toString()})()`, {
-          window: {
-            require(name) {
-              assert.equal(name, 'WAWebCollections');
-              return { Chat: { getModelsArray: () => [
-                { groupMetadata: null, get id() { assert.fail('ignorer les discussions privées'); } },
-                group,
-              ] } };
-            },
-          },
-        });
-        return structuredClone(result);
-      },
-    },
-  };
-  assert.deepEqual(await getGroups(client), [{ id: '123-456@g.us', name: 'TEST bot sondages' }]);
-});
-
-test('lecture légère : données incompatibles refusées, liste vide distincte d’une erreur', async () => {
-  for (const groups of [null, {}, [null], [{ id: '123@c.us', name: 'privé' }],
-    [{ id: '123@g.us', name: null }], [{ id: '123@g.us' }]]) {
-    await assert.rejects(getGroups({ pupPage: { evaluate: async () => groups } }), /incompatible/);
-  }
-  assert.deepEqual(await getGroups({ pupPage: { evaluate: async () => [] } }), []);
-  const original = new Error('r');
-  await assert.rejects(getGroups({ pupPage: { evaluate: async () => { throw original; } } }), error => {
-    assert.match(error.message, /Lecture des groupes impossible : r/);
-    assert.equal(error.cause, original);
-    return true;
-  });
-  await assert.rejects(getGroups({ pupPage: { evaluate: async () =>
-    Array.from({ length: 100 }, () => ({ id: '123@g.us' })) } }), error => {
-    assert.match(error.message, /index=0, idValide=true, typeNom=undefined/);
-    assert.match(error.message, /index=2/);
-    assert.doesNotMatch(error.message, /index=3|123@g\.us/);
-    return true;
-  });
-});
-
-test('groupes sans nom : avertissement explicite, seul le groupe exact et nommé autorise l’envoi', async t => {
-  const logs = t.mock.method(console, 'log', () => {});
-  const groups = [
-    { id: '111@g.us', name: '' }, { id: '222@g.us', name: '   ' },
-    { id: '333@g.us', name: 'TEST bot sondages' },
-  ];
-  const client = { pupPage: { evaluate: async () => groups } };
-  assert.deepEqual(await getGroups(client), groups);
-  const warning = JSON.parse(logs.mock.calls[0].arguments[0]);
-  assert.equal(warning.event, 'groups_without_name');
-  assert.equal(warning.severity, 'WARNING');
-  assert.equal(warning.count, 2);
-  await checkGroup(client, '333@g.us', 'TEST bot sondages');
-  await assert.rejects(checkGroup(client, '333@g.us', 'test bot sondages'), /Groupe incorrect/);
-  await assert.rejects(checkGroup(client, '444@g.us', 'TEST bot sondages'), /Groupe incorrect/);
-  await assert.rejects(checkGroup(client, '111@g.us', ''), /Groupe incorrect/);
-  await assert.rejects(checkGroup(client, '222@g.us', '   '), /Groupe incorrect/);
-});
-
-test('appairage : fermeture puis archive privée, même si la lecture des groupes échoue', async t => {
-  t.mock.method(console, 'log', () => {});
-  const tables = t.mock.method(console, 'table', () => {});
-  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wa-test-'));
-  try {
-    for (const fails of [false, true]) {
-      const profile = path.join(tmp, fails ? 'failed-profile' : 'profile');
-      const archive = path.join(tmp, fails ? 'failed-session.tar.gz' : 'session.tar.gz');
-      await fs.mkdir(profile);
-      const client = new EventEmitter();
-      client.pupBrowser = {};
-      client.initialize = async () => client.emit('ready');
-      client.pupPage = { evaluate: async () => {
-        if (fails) throw new Error('r');
-        return [{ id: '123@g.us', name: 'test' }, { id: '456@g.us', name: '' }];
-      } };
-      client.destroy = async () => {
-        await fs.writeFile(path.join(profile, 'session-closed'), 'session-factice');
-        client.pupBrowser = null;
-      };
-      if (fails) await assert.rejects(pairSession(client, profile, archive), /Lecture des groupes impossible : r/);
-      else await pairSession(client, profile, archive);
-      assert.equal(client.pupBrowser, null);
-      assert.equal((await fs.stat(archive)).mode & 0o777, 0o600);
-      const { stdout } = await exec('tar', ['-xOzf', archive, './session-closed']);
-      assert.equal(stdout, 'session-factice');
-      await assert.rejects(fs.stat(profile), { code: 'ENOENT' });
-    }
-    assert.equal(tables.mock.callCount(), 1);
-    assert.deepEqual(tables.mock.calls[0].arguments[0], [
-      { nom: 'test', GROUP_ID: '123@g.us' },
-      { nom: '(nom indisponible)', GROUP_ID: '456@g.us' },
-    ]);
-  } finally {
-    await fs.rm(tmp, { recursive: true, force: true });
-  }
-});
-
-test('appairage refusé ou archive expirée : navigateur fermé, ancienne archive non remplacée', async t => {
-  const logs = t.mock.method(console, 'log', () => {});
-  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wa-test-'));
-  try {
-    const archive = path.join(tmp, 'session.tar.gz');
-    await fs.writeFile(archive, 'ancienne-session');
-    const client = new EventEmitter();
-    client.pupBrowser = {};
-    client.initialize = async () => client.emit('auth_failure');
-    client.destroy = async () => { client.pupBrowser = null; };
-    await assert.rejects(pairSession(client, tmp, archive), /Authentification WhatsApp refusée/);
-    assert.equal(client.pupBrowser, null);
-    assert.equal(await fs.readFile(archive, 'utf8'), 'ancienne-session');
-    assert.equal(logs.mock.callCount(), 0);
-    const expired = new EventEmitter();
-    expired.pupBrowser = {};
-    expired.initialize = async () => expired.emit('qr', 'qr-ne-pas-afficher');
-    expired.destroy = async () => { expired.pupBrowser = null; };
-    await assert.rejects(pairSession(expired, tmp, archive, false), /Session expirée/);
-    assert.equal(expired.pupBrowser, null);
-    assert.equal(await fs.readFile(archive, 'utf8'), 'ancienne-session');
-    assert.equal(logs.mock.callCount(), 0);
-  } finally {
-    await fs.rm(tmp, { recursive: true, force: true });
-  }
-});
-
-test('archive privée : données conservées, caches/verrous exclus, extraction possible', async () => {
-  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wa-test-'));
-  try {
-    const profile = path.join(tmp, 'profile');
-    await fs.mkdir(path.join(profile, 'session', 'Default', 'Cache'), { recursive: true });
-    await fs.writeFile(path.join(profile, 'session', 'Default', 'Cache', 'cache'), 'inutile');
-    await fs.writeFile(path.join(profile, 'session', 'Default', 'IndexedDB'), 'session-factice');
-    await fs.symlink('ancien-hote-123', path.join(profile, 'session', 'SingletonLock'));
-    const archive = path.join(tmp, 'session.tar.gz');
-    await packSession(profile, archive);
-    const { stdout } = await exec('tar', ['-tzf', archive]);
-    assert.match(stdout, /IndexedDB/);
-    assert.doesNotMatch(stdout, /Singleton|Cache/);
-    assert.equal((await fs.stat(archive)).mode & 0o777, 0o600);
-    await fs.mkdir(path.join(tmp, 'restore'));
-    await exec('tar', ['--no-same-owner', '-xzf', archive, '-C', path.join(tmp, 'restore')]);
-    assert.equal(await fs.readFile(path.join(tmp, 'restore/session/Default/IndexedDB'), 'utf8'), 'session-factice');
-  } finally {
-    await fs.rm(tmp, { recursive: true, force: true });
-  }
-});
-
-test('générateur : 365 événements explicites ; commande inconnue refusée', async t => {
-  const lines = [];
-  t.mock.method(console, 'log', line => lines.push(line));
+test('calendar still emits 365 events and removed commands fail explicitly', async t => {
+  const output = t.mock.method(console, 'log', () => {});
   await main('calendar');
-  assert.equal(lines.length, 366);
-  assert.equal(lines[0], 'Date,Actif,Titre');
-  assert.equal(new Set(lines.slice(1).map(line => line.split(',')[0])).size, 365);
-  assert.match(lines[1], /^\d{4}-\d{2}-\d{2},OUI,TEST/);
-  await assert.rejects(main('autre'), /Commande attendue/);
+  assert.equal(output.mock.callCount(), 366);
+  assert.equal(output.mock.calls[0].arguments[0], 'Date,Actif,Titre');
+  await assert.rejects(main('groups'), /retiré/);
+  await assert.rejects(main('pair', { CLOUD_RUN_JOB: 'test' }), /interactif/);
 });
